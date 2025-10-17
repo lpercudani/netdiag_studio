@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""
+NetDiag Studio – a simple cross‑platform GUI that combines:
+  • Ping
+  • Traceroute (tracert on Windows)
+  • Packet capture (via pyshark/tshark)
+
+Requirements (install via pip):
+  pip install PySide6 pyshark
+
+System requirements for capture:
+  • Wireshark/tshark must be installed and available on PATH
+  • macOS/Linux: you may need sudo or grant dumpcap permissions
+  • Windows: install Wireshark (includes tshark) and run as admin for capture
+
+Run:
+  python netdiag_studio.py
+"""
+
+import sys
+import os
+import platform
+import subprocess
+import threading
+import queue
+import time
+from typing import Optional
+
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtWidgets import (
+    QApplication, QWidget, QMainWindow, QTabWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QPlainTextEdit, QMessageBox, QSpinBox,
+    QCheckBox
+)
+
+# Optional import for capture
+try:
+    import pyshark  # type: ignore
+    HAS_PYSHARK = True
+except Exception:
+    HAS_PYSHARK = False
+
+
+# ---------------------- Utility ----------------------
+
+def is_windows() -> bool:
+    return platform.system().lower().startswith("win")
+
+
+def which(cmd: str) -> Optional[str]:
+    """Return path to command or None."""
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        full = os.path.join(p, cmd)
+        if os.path.isfile(full) and os.access(full, os.X_OK):
+            return full
+    return None
+
+
+# ---------------------- Worker base ----------------------
+
+class ProcessWorker(threading.Thread):
+    def __init__(self, cmd: list[str], out_q: queue.Queue[str]):
+        super().__init__(daemon=True)
+        self.cmd = cmd
+        self.out_q = out_q
+        self._stop = threading.Event()
+
+    def run(self):
+        try:
+            self.out_q.put(f"\n$ {' '.join(self.cmd)}\n")
+            proc = subprocess.Popen(
+                self.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+            with proc.stdout:
+                for line in proc.stdout:  # type: ignore
+                    if self._stop.is_set():
+                        break
+                    self.out_q.put(line)
+            proc.wait()
+            self.out_q.put(f"\n[exit code {proc.returncode}]\n")
+        except FileNotFoundError:
+            self.out_q.put("Error: command not found. Is it installed and on PATH?\n")
+        except Exception as e:
+            self.out_q.put(f"Error: {e}\n")
+
+    def stop(self):
+        self._stop.set()
+
+
+# ---------------------- Capture worker ----------------------
+
+class CaptureWorker(threading.Thread):
+    def __init__(self, interface: Optional[str], bpf_filter: str, duration_s: int, out_q: queue.Queue[str]):
+        super().__init__(daemon=True)
+        self.interface = interface
+        self.bpf_filter = bpf_filter
+        self.duration_s = duration_s
+        self.out_q = out_q
+        self._stop = threading.Event()
+
+    def run(self):
+        if not HAS_PYSHARK:
+            self.out_q.put("Error: pyshark is not installed. Run 'pip install pyshark'\n")
+            return
+        # tshark presence check
+        tshark_cmd = which("tshark.exe" if is_windows() else "tshark")
+        if not tshark_cmd:
+            self.out_q.put("Error: tshark not found. Install Wireshark and ensure tshark is on PATH.\n")
+            return
+        try:
+            cap = pyshark.LiveCapture(interface=self.interface, bpf_filter=self.bpf_filter)
+            self.out_q.put(f"Starting capture (duration {self.duration_s}s, filter='{self.bpf_filter or 'none'}', iface='{self.interface or 'auto'}')...\n")
+            start = time.time()
+            for pkt in cap.sniff_continuously():
+                if self._stop.is_set() or (time.time() - start) > self.duration_s:
+                    break
+                # Build a readable summary line
+                try:
+                    ts = getattr(pkt, 'sniff_time', None)
+                    layer = pkt.highest_layer if hasattr(pkt, 'highest_layer') else 'PKT'
+                    src = getattr(getattr(pkt, 'ip', None), 'src', None) or getattr(getattr(pkt, 'ipv6', None), 'src', '?')
+                    dst = getattr(getattr(pkt, 'ip', None), 'dst', None) or getattr(getattr(pkt, 'ipv6', None), 'dst', '?')
+                    length = getattr(pkt, 'length', '?')
+                    self.out_q.put(f"[{ts}] {layer:>8} {src} -> {dst} len={length}\n")
+                except Exception:
+                    self.out_q.put("(captured a packet; unable to summarize)\n")
+            cap.close()
+            self.out_q.put("Capture finished.\n")
+        except Exception as e:
+            self.out_q.put(f"Capture error: {e}\n")
+
+    def stop(self):
+        self._stop.set()
+
+
+# ---------------------- Tabs ----------------------
+
+class PingTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Target host/IP:"))
+        self.target = QLineEdit()
+        self.target.setPlaceholderText("e.g., 8.8.8.8 or example.com")
+        row.addWidget(self.target)
+        self.count = QSpinBox()
+        self.count.setRange(1, 100)
+        self.count.setValue(4)
+        row.addWidget(QLabel("Count:"))
+        row.addWidget(self.count)
+        self.dns = QCheckBox("No DNS (-n)")
+        row.addWidget(self.dns)
+        self.run_btn = QPushButton("Run Ping")
+        row.addWidget(self.run_btn)
+        layout.addLayout(row)
+
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        layout.addWidget(self.output)
+
+        self.out_q: queue.Queue[str] = queue.Queue()
+        self.worker: Optional[ProcessWorker] = None
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.drain_queue)
+        self.run_btn.clicked.connect(self.run_ping)
+
+    def run_ping(self):
+        tgt = self.target.text().strip()
+        if not tgt:
+            QMessageBox.warning(self, "Ping", "Please enter a target host or IP.")
+            return
+        # Windows vs Unix args
+        if is_windows():
+            cmd = ["ping", "-n", str(self.count.value())]
+            if self.dns.isChecked():
+                cmd.append("-a")  # Windows has no pure "no DNS"; omit reverse lookup by default
+            cmd.append(tgt)
+        else:
+            cmd = ["ping", "-c", str(self.count.value())]
+            if self.dns.isChecked():
+                cmd.append("-n")
+            cmd.append(tgt)
+        self.output.appendPlainText("\nRunning ping...\n")
+        self.worker = ProcessWorker(cmd, self.out_q)
+        self.worker.start()
+        self.timer.start(100)
+
+    def drain_queue(self):
+        try:
+            while True:
+                line = self.out_q.get_nowait()
+                self.output.appendPlainText(line.rstrip("\n"))
+        except queue.Empty:
+            pass
+
+
+class TraceTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Target host/IP:"))
+        self.target = QLineEdit()
+        self.target.setPlaceholderText("e.g., 8.8.8.8 or example.com")
+        row.addWidget(self.target)
+        self.maxhop = QSpinBox(); self.maxhop.setRange(1, 64); self.maxhop.setValue(30)
+        row.addWidget(QLabel("Max hops:")); row.addWidget(self.maxhop)
+        self.run_btn = QPushButton("Run Traceroute")
+        row.addWidget(self.run_btn)
+        layout.addLayout(row)
+
+        self.output = QPlainTextEdit(); self.output.setReadOnly(True)
+        layout.addWidget(self.output)
+
+        self.out_q: queue.Queue[str] = queue.Queue()
+        self.worker: Optional[ProcessWorker] = None
+        self.timer = QTimer(self); self.timer.timeout.connect(self.drain_queue)
+        self.run_btn.clicked.connect(self.run_trace)
+
+    def run_trace(self):
+        tgt = self.target.text().strip()
+        if not tgt:
+            QMessageBox.warning(self, "Traceroute", "Please enter a target host or IP.")
+            return
+        if is_windows():
+            cmd = ["tracert", "-h", str(self.maxhop.value()), tgt]
+        else:
+            cmd = ["traceroute", "-m", str(self.maxhop.value()), tgt]
+        self.output.appendPlainText("\nRunning traceroute...\n")
+        self.worker = ProcessWorker(cmd, self.out_q)
+        self.worker.start()
+        self.timer.start(100)
+
+    def drain_queue(self):
+        try:
+            while True:
+                line = self.out_q.get_nowait()
+                self.output.appendPlainText(line.rstrip("\n"))
+        except queue.Empty:
+            pass
+
+
+class CaptureTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Interface (optional):"))
+        self.iface = QLineEdit(); self.iface.setPlaceholderText("e.g., eth0, en0, Wi‑Fi. Leave blank for default.")
+        row.addWidget(self.iface)
+        row.addWidget(QLabel("BPF filter:"))
+        self.filter = QLineEdit(); self.filter.setPlaceholderText("e.g., host 8.8.8.8 or tcp port 443")
+        row.addWidget(self.filter)
+        row.addWidget(QLabel("Duration (s):"))
+        self.duration = QSpinBox(); self.duration.setRange(1, 3600); self.duration.setValue(15)
+        row.addWidget(self.duration)
+        self.start_btn = QPushButton("Start Capture")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        row.addWidget(self.start_btn); row.addWidget(self.stop_btn)
+        layout.addLayout(row)
+
+        self.output = QPlainTextEdit(); self.output.setReadOnly(True)
+        layout.addWidget(self.output)
+
+        self.out_q: queue.Queue[str] = queue.Queue()
+        self.worker: Optional[CaptureWorker] = None
+        self.timer = QTimer(self); self.timer.timeout.connect(self.drain_queue)
+
+        self.start_btn.clicked.connect(self.start_capture)
+        self.stop_btn.clicked.connect(self.stop_capture)
+
+    def start_capture(self):
+        if self.worker is not None:
+            QMessageBox.information(self, "Capture", "Capture already running.")
+            return
+        iface = self.iface.text().strip() or None
+        bpf = self.filter.text().strip()
+        dur = self.duration.value()
+        self.output.appendPlainText("\nStarting capture...\n")
+        self.worker = CaptureWorker(iface, bpf, dur, self.out_q)
+        self.worker.start()
+        self.timer.start(100)
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+    def stop_capture(self):
+        if self.worker:
+            self.worker.stop()
+            self.worker = None
+            self.output.appendPlainText("Stop requested.\n")
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+
+    def drain_queue(self):
+        try:
+            while True:
+                line = self.out_q.get_nowait()
+                self.output.appendPlainText(line.rstrip("\n"))
+        except queue.Empty:
+            pass
+
+
+# ---------------------- Main Window ----------------------
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("NetDiag Studio – Ping / Traceroute / Capture")
+        self.resize(900, 600)
+
+        tabs = QTabWidget()
+        tabs.addTab(PingTab(), "Ping")
+        tabs.addTab(TraceTab(), "Traceroute")
+        tabs.addTab(CaptureTab(), "Packet Capture")
+        self.setCentralWidget(tabs)
+
+
+def main():
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
